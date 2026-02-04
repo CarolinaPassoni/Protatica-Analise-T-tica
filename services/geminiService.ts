@@ -1,306 +1,334 @@
-
 import { GoogleGenAI } from "@google/genai";
-import type { Analysis, GroundingSource } from '../types';
+import type { Analysis, GroundingSource } from "../types";
 
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+/**
+ * PROTATICA — Gemini Service (Hardened)
+ * Garantias:
+ * - videoUrl na resposta é EXATAMENTE o link colado pelo usuário.
+ * - Bloqueia análise se o modelo retornar outro videoId (anti “troca de vídeo”).
+ * - Valida título via YouTube oEmbed; se não bater, bloqueia.
+ * - Se não houver segurança, retorna erro (não chuta).
+ */
 
-const parseJsonResponse = <T,>(text: string): T | null => {
-    try {
-        const start = text.indexOf('{');
-        const end = text.lastIndexOf('}');
-        
-        if (start === -1 || end === -1) {
-            console.error("No JSON object found in response");
-            return null;
-        }
+const getApiKey = (): string | undefined => {
+  // Vite: só variáveis com prefixo VITE_ chegam no browser
+  const viteKey = (import.meta as any)?.env?.VITE_GEMINI_API_KEY as string | undefined;
 
-        const jsonStr = text.substring(start, end + 1);
-        return JSON.parse(jsonStr);
-    } catch (e) {
-        console.error("Failed to parse JSON:", e);
-        return null;
-    }
+  // Compat: caso você tenha injetado via define (process.env.*)
+  const procAny = (globalThis as any)?.process;
+  const procKey = procAny?.env?.API_KEY as string | undefined;
+  const procGeminiKey = procAny?.env?.GEMINI_API_KEY as string | undefined;
+
+  return viteKey || procKey || procGeminiKey;
 };
 
-const getAnalysisFromWeb = async (youtubeUrl: string, mode: 'web' | 'video' = 'web'): Promise<Analysis> => {
-    const model = 'gemini-3-pro-preview';
-    const isDetailed = mode === 'video';
-    
-    const analysisPrompt = `
-      SISTEMA DE AUDITORIA TÁTICA PROTATICA V6 — PRECISÃO E RASTREABILIDADE.
+const getClient = (): GoogleGenAI => {
+  const apiKey = getApiKey();
+  if (!apiKey) {
+    throw new Error(
+      "Chave de API não configurada. Defina VITE_GEMINI_API_KEY nas variáveis de ambiente (Vercel/Local) e faça um novo deploy."
+    );
+  }
+  return new GoogleGenAI({ apiKey });
+};
 
-      REFERÊNCIA OBRIGATÓRIA:
-      LINK DO YOUTUBE: ${youtubeUrl}
+const extractYouTubeId = (url: string): string | null => {
+  try {
+    const u = new URL(url);
+    const v = u.searchParams.get("v");
+    if (v) return v;
 
-      REGRA DE OURO (CRÍTICA):
-      - Você deve usar EXATAMENTE o link fornecido pelo usuário em "videoUrl" (sem encurtar, sem alterar parâmetros, sem trocar por outra forma).
-      - A análise precisa ser CONDIZENTE com o conteúdo do vídeo e com a partida correta.
+    if (u.hostname.endsWith("youtu.be")) {
+      const id = u.pathname.split("/").filter(Boolean)[0];
+      return id || null;
+    }
 
-      PROTOCOLO DE VERIFICAÇÃO EM CADEIA (CRÍTICO):
-      1) IDENTIFICAÇÃO PRIMÁRIA: Use o Google Search para acessar o link ${youtubeUrl}. Extraia TÍTULO EXATO, CANAL e DATA DE PUBLICAÇÃO.
-      2) IDENTIFICAÇÃO DA PARTIDA: Pelo título/descrição (e, se necessário, fontes confiáveis), determine: times, competição e data do jogo.
-      3) VALIDAÇÃO: Busque escalações, placar e estatísticas SOMENTE da partida identificada no passo 2.
-      4) CONSISTÊNCIA COM O VÍDEO: A análise deve refletir o que o vídeo mostra/comenta (momentos, comportamento tático, ajustes).
+    const parts = u.pathname.split("/").filter(Boolean);
+    const shortsIdx = parts.indexOf("shorts");
+    if (shortsIdx >= 0 && parts[shortsIdx + 1]) return parts[shortsIdx + 1];
 
-      DIRETRIZ DE ERRO:
-      Se você não conseguir identificar a partida com confiança suficiente, retorne:
-      um JSON contendo a chave "error" com a mensagem: Incapaz de verificar a partida do vídeo ${youtubeUrl}. Por favor, verifique o link.
+    const embedIdx = parts.indexOf("embed");
+    if (embedIdx >= 0 && parts[embedIdx + 1]) return parts[embedIdx + 1];
 
-      MODO: ${isDetailed ? 'ANÁLISE DETALHADA (VÍDEO) — COMPLETA, MULTIPARÂMETROS' : 'ANÁLISE RÁPIDA (WEB) — OBJETIVA'}
+    return null;
+  } catch {
+    return null;
+  }
+};
 
-      SAÍDA OBRIGATÓRIA (JSON):
-      {
-        "videoTitle": "TÍTULO EXATO DO VÍDEO",
-        "videoUrl": "COPIE EXATAMENTE O LINK DO YOUTUBE INFORMADO NO INÍCIO (SEM ALTERAR)",
-        "timeA": "Time A",
-        "timeB": "Time B",
-        "placar": "Placar real (ex: 2 x 1)",
-        "resumoPartida": "Resumo fiel ao vídeo e à partida correta.",
-        "momentosChave": "Cronologia dos lances e acontecimentos mais relevantes (com minutos quando possível).",
+const fetchYouTubeOEmbed = async (
+  youtubeUrl: string
+): Promise<{ title?: string; author_name?: string } | null> => {
+  try {
+    const endpoint = `https://www.youtube.com/oembed?format=json&url=${encodeURIComponent(
+      youtubeUrl
+    )}`;
+    const res = await fetch(endpoint, { method: "GET" });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return { title: data?.title, author_name: data?.author_name };
+  } catch {
+    return null;
+  }
+};
 
-        "contextoPartida": {
-          "competicao": "Ex: Brasileirão / Libertadores / Copa do Mundo",
-          "temporada": "Ex: 2023/24",
-          "fase": "Ex: final / semifinal / rodada X",
-          "dataJogo": "DD/MM/AAAA (se encontrado)",
-          "estadio": "Nome (se encontrado)",
-          "cidade": "Cidade (se encontrado)",
-          "arbitro": "Nome (se encontrado)",
-          "publico": "Número (se encontrado)",
-          "condicoesClimaticas": "Se o vídeo/fontes indicarem"
-        },
+const parseJsonResponse = <T,>(text: string): T | null => {
+  try {
+    const start = text.indexOf("{");
+    const end = text.lastIndexOf("}");
+    if (start === -1 || end === -1) return null;
+    const jsonStr = text.substring(start, end + 1);
+    return JSON.parse(jsonStr);
+  } catch {
+    return null;
+  }
+};
 
-        "formacoes": {
-          "timeA": {
-            "esquema": "Ex: 4-3-3",
-            "titulares": ["..."],
-            "banco": ["..."],
-            "destaquesFuncionais": "Papéis, inversões, rotações, encaixes, etc."
-          },
-          "timeB": {
-            "esquema": "Ex: 4-4-2",
-            "titulares": ["..."],
-            "banco": ["..."],
-            "destaquesFuncionais": "Papéis, inversões, rotações, encaixes, etc."
-          }
-        },
+const normalizeTitle = (s: string) =>
+  s
+    .trim()
+    .toLowerCase()
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .replace(/\s+/g, " ");
 
-        "faseDefensiva": {
-          "timeA": {"posicionamento":"...","compactacao_pressao":"...","transicao":"..."},
-          "timeB": {"posicionamento":"...","compactacao_pressao":"...","transicao":"..."}
-        },
+const titlesLooselyMatch = (a: string, b: string): boolean => {
+  const t1 = normalizeTitle(a);
+  const t2 = normalizeTitle(b);
+  if (!t1 || !t2) return false;
+  return t1 === t2 || t1.includes(t2) || t2.includes(t1);
+};
 
-        "faseOfensiva": {
-          "timeA": {"saidaDeBola":"...","criacao":"...","finalizacao_movimentacao":"..."},
-          "timeB": {"saidaDeBola":"...","criacao":"...","finalizacao_movimentacao":"..."}
-        },
+const getAnalysisFromWeb = async (
+  youtubeUrl: string,
+  mode: "web" | "video" = "web"
+): Promise<Analysis> => {
+  const model = "gemini-3-pro-preview";
+  const isDetailed = mode === "video";
 
-        "pressao": {
-          "timeA": {"alturaBloco":"...","gatilhos":"...","comportamentoSemBola":"...","ppdaEstimado":"...","recuperacaoAlta":"..."},
-          "timeB": {"alturaBloco":"...","gatilhos":"...","comportamentoSemBola":"...","ppdaEstimado":"...","recuperacaoAlta":"..."}
-        },
+  // GUARDA 1: exige videoId válido no link
+  const expectedVideoId = extractYouTubeId(youtubeUrl);
+  if (!expectedVideoId) {
+    throw new Error(
+      "Link do YouTube inválido ou sem videoId. Cole a URL completa do vídeo (ex: https://www.youtube.com/watch?v=XXXX)."
+    );
+  }
 
-        "modeloDeJogo": {
-          "timeA": {
-            "organizacao":"Princípios e estrutura com bola/sem bola",
-            "saidaDeBola":"Padrões (3+1, 2+3, apoios, atração, etc.)",
-            "progressao":"Como progride (corredor/entrelinhas/terceiro homem)",
-            "tercoFinal":"Ataque ao último terço (amplitudes, half-space, cruzamentos, infiltrações)",
-            "finalizacao":"Volume, qualidade, zonas e tipos",
-            "transicaoOfensiva":"Como acelera após recuperar",
-            "transicaoDefensiva":"Como reage ao perder",
-            "contraPressao":"Intensidade e organização"
-          },
-          "timeB": {
-            "organizacao":"...",
-            "saidaDeBola":"...",
-            "progressao":"...",
-            "tercoFinal":"...",
-            "finalizacao":"...",
-            "transicaoOfensiva":"...",
-            "transicaoDefensiva":"...",
-            "contraPressao":"..."
-          }
-        },
+  // GUARDA 2: valida o vídeo via oEmbed (link público/correto)
+  const oembed = await fetchYouTubeOEmbed(youtubeUrl);
+  if (!oembed?.title) {
+    throw new Error(
+      "Não foi possível validar esse vídeo pelo YouTube (oEmbed). Verifique se o link está correto e público."
+    );
+  }
 
-        "estrategiaComportamento": {
-          "controleRitmoAdaptacao": "Como cada time controlou o ritmo e se adaptou ao jogo.",
-          "bolasParadas": "Resumo de bolas paradas (ofensivas/defensivas) e impacto."
-        },
+  const analysisPrompt = `
+SISTEMA PROTATICA — PRECISÃO E RASTREABILIDADE (HARDENED)
 
-        "estatisticas": {
-          "posseDeBola": {"timeA": "XX%", "timeB": "XX%"},
-          "finalizacoes": {"timeA": "X", "timeB": "Y"},
-          "finalizacoesNoAlvo": {"timeA": "X", "timeB": "Y"},
-          "passesCertos": {"timeA": "XX%", "timeB": "XX%"},
-          "faltasCometidas": {"timeA": "X", "timeB": "Y"},
-          "desarmes": {"timeA": "X", "timeB": "Y"},
-          "escanteios": {"timeA": "X", "timeB": "Y"},
-          "impedimentos": {"timeA": "X", "timeB": "Y"},
-          "mapaDeCalor": {
-            "timeA": {"tercoDefensivo": "XX%", "tercoMedio": "XX%", "tercoOfensivo": "XX%"},
-            "timeB": {"tercoDefensivo": "XX%", "tercoMedio": "XX%", "tercoOfensivo": "XX%"}
-          }
-        },
+REFERÊNCIA OBRIGATÓRIA:
+- LINK DO YOUTUBE (copie exatamente): ${youtubeUrl}
+- VIDEO_ID_ESPERADO: ${expectedVideoId}
+- METADADOS VERIFICADOS (oEmbed):
+  - titulo: ${oembed.title}
+  - canal: ${oembed.author_name ?? "indisponivel"}
 
-        "indicadoresAvancados": {
-          "xG": {"timeA":"(se houver)", "timeB":"(se houver)"},
-          "grandesChances": {"timeA":"(se houver)", "timeB":"(se houver)"},
-          "chutesNaArea": {"timeA":"(se houver)", "timeB":"(se houver)"},
-          "chutesForaDaArea": {"timeA":"(se houver)", "timeB":"(se houver)"},
-          "passesTercoFinal": {"timeA":"(se houver)", "timeB":"(se houver)"},
-          "passesProgressivos": {"timeA":"(se houver)", "timeB":"(se houver)"},
-          "cruzamentos": {"timeA":"(se houver)", "timeB":"(se houver)"},
-          "duelosGanhos": {"timeA":"(se houver)", "timeB":"(se houver)"},
-          "perdasDePosse": {"timeA":"(se houver)", "timeB":"(se houver)"},
-          "recuperacoes": {"timeA":"(se houver)", "timeB":"(se houver)"},
-          "fieldTilt": {"timeA":"(se houver)", "timeB":"(se houver)"}
-        },
+REGRAS CRÍTICAS:
+1) NÃO troque o vídeo por outro. Analise SOMENTE o vídeo com VIDEO_ID_ESPERADO.
+2) "videoUrl" deve ser EXATAMENTE o link fornecido (sem encurtar/normalizar/remover parâmetros).
+3) "videoId" deve ser exatamente: ${expectedVideoId}
+4) "videoTitle" deve corresponder ao título verificado do oEmbed (diferenças pequenas como emoji/espaços são ok).
+5) Se não conseguir identificar a partida com segurança, retorne error (não chute).
 
-        "pontosFortes": { "timeA": ["..."], "timeB": ["..."] },
-        "pontosFracos": { "timeA": ["..."], "timeB": ["..."] },
+DIRETRIZ DE ERRO:
+Retorne um JSON contendo "error" com:
+"Incapaz de identificar com segurança a partida do vídeo ${youtubeUrl}. Por favor, verifique o link."
 
-        "analiseJogadores": [
-          {"nome":"Jogador", "analise":"Função, impacto, decisões, erros/acertos (condizente com vídeo e partida)."}
-        ],
+MODO: ${isDetailed ? "DETALHADO" : "RÁPIDO"}
 
-        "linhaDoTempo": [
-          {"minuto":"12'", "time":"Time A", "tipo":"chance/gol/cartao/ajuste/substituicao", "descricao":"...", "impactoTatico":"..."}
-        ],
+SAÍDA (JSON):
+{
+  "videoTitle": "TÍTULO EXATO DO VÍDEO",
+  "videoUrl": "${youtubeUrl}",
+  "videoId": "${expectedVideoId}",
 
-        "ajustesTreinadores": "Mudanças táticas durante o jogo (substituições e ajustes) e efeitos.",
-        "recomendacoesTaticas": {
-          "timeA": ["Ajuste 1", "Ajuste 2"],
-          "timeB": ["Ajuste 1", "Ajuste 2"]
-        },
+  "timeA": "Time A",
+  "timeB": "Time B",
+  "placar": "Placar real",
+  "resumoPartida": "",
+  "momentosChave": "",
 
-        "conclusaoRecomendacoes": "Veredito técnico final e recomendações práticas.",
-        "verificacaoAuditoria": {
-          "partidaIdentificada": "TimeA x TimeB — competição — data",
-          "fontesPrincipais": ["..."],
-          "observacoes": "Limitações, divergências ou ausência de dados.",
-          "nivelConfianca": "alta | media | baixa"
-        }
+  "contextoPartida": { "competicao":"", "temporada":"", "fase":"", "dataJogo":"", "estadio":"", "cidade":"" },
+
+  "formacoes": {
+    "timeA": { "esquema":"", "titulares":[], "banco":[], "destaquesFuncionais":"" },
+    "timeB": { "esquema":"", "titulares":[], "banco":[], "destaquesFuncionais":"" }
+  },
+
+  "faseDefensiva": {
+    "timeA": { "posicionamento":"", "compactacao_pressao":"", "transicao":"" },
+    "timeB": { "posicionamento":"", "compactacao_pressao":"", "transicao":"" }
+  },
+
+  "faseOfensiva": {
+    "timeA": { "saidaDeBola":"", "criacao":"", "finalizacao_movimentacao":"" },
+    "timeB": { "saidaDeBola":"", "criacao":"", "finalizacao_movimentacao":"" }
+  },
+
+  "estrategiaComportamento": { "controleRitmoAdaptacao":"", "bolasParadas":"" },
+
+  "estatisticas": {
+    "posseDeBola": { "timeA":"", "timeB":"" },
+    "finalizacoes": { "timeA":"", "timeB":"" },
+    "finalizacoesNoAlvo": { "timeA":"", "timeB":"" }
+  },
+
+  "pontosFortes": { "timeA": [], "timeB": [] },
+  "pontosFracos": { "timeA": [], "timeB": [] },
+
+  "analiseJogadores": [],
+  "conclusaoRecomendacoes": "",
+
+  "verificacaoAuditoria": { "partidaIdentificada":"", "fontesPrincipais":[], "observacoes":"", "nivelConfianca":"alta | media | baixa" }
+}
+`;
+
+  const response = await getClient().models.generateContent({
+    model,
+    contents: analysisPrompt,
+    config: {
+      tools: [{ googleSearch: {} }],
+      thinkingConfig: { thinkingBudget: 6000 },
+    },
+  });
+
+  const analysis = parseJsonResponse<any>(response.text);
+
+  if (!analysis) {
+    throw new Error("Erro Crítico: não consegui processar a resposta do modelo. Tente novamente.");
+  }
+
+  if (analysis.error) {
+    throw new Error(analysis.error);
+  }
+
+  // GUARDA 3: preserva link original EXATO
+  analysis.videoUrl = youtubeUrl;
+
+  // GUARDA 4: exige videoId e valida igual ao esperado
+  const returnedId = (analysis as any)?.videoId as string | undefined;
+  if (!returnedId) {
+    throw new Error(
+      "Erro: o modelo não retornou videoId. A análise foi bloqueada para evitar troca de vídeo."
+    );
+  }
+  if (returnedId !== expectedVideoId) {
+    throw new Error(
+      `Erro: o modelo retornou um vídeo diferente do solicitado (ID ${returnedId} != ${expectedVideoId}).`
+    );
+  }
+
+  // GUARDA 5: título deve bater com oEmbed (match “solto”)
+  if (typeof analysis.videoTitle !== "string" || !titlesLooselyMatch(oembed.title, analysis.videoTitle)) {
+    throw new Error(
+      "Erro: o título retornado não corresponde ao vídeo informado. A análise foi bloqueada para evitar troca de vídeo."
+    );
+  }
+
+  // Fontes (grounding)
+  const sources: GroundingSource[] = [];
+  const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks;
+  if (chunks) {
+    chunks.forEach((chunk: any) => {
+      if (chunk.web && chunk.web.uri) {
+        sources.push({ title: chunk.web.title, uri: chunk.web.uri });
       }
-
-      IMPORTANTE:
-      - Se estiver em modo ANÁLISE RÁPIDA (WEB), você pode resumir/omitir listas longas (titulares/banco/linhaDoTempo), mas mantenha a estrutura e preencha ao menos com valores coerentes (ou strings vazias) sem inventar fatos conflitantes.
-    
-    `;
-    
-    const response = await ai.models.generateContent({
-        model: model,
-        contents: analysisPrompt,
-        config: {
-            tools: [{ googleSearch: {} }],
-            thinkingConfig: { thinkingBudget: 6000 }
-        }
     });
+  }
 
-    const analysis = parseJsonResponse<any>(response.text);
+  // Sempre inclui o próprio vídeo como primeira fonte; remove duplicados
+  const uniqueSources: GroundingSource[] = [
+    { title: "YouTube (vídeo analisado)", uri: youtubeUrl },
+    ...sources,
+  ].filter((src, idx, arr) => {
+    const uri = (src.uri || "").trim();
+    if (!uri) return false;
+    return idx === arr.findIndex((s) => (s.uri || "").trim() === uri);
+  });
 
-    if (!analysis) {
-        throw new Error("Erro Crítico: O sistema não conseguiu processar os dados deste vídeo. Tente novamente.");
-    }
+  analysis.sources = uniqueSources;
 
-    if (analysis.error) {
-        throw new Error(analysis.error);
-    }
-
-    const sources: GroundingSource[] = [];
-    const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks;
-    if (chunks) {
-      chunks.forEach((chunk: any) => {
-        if (chunk.web && chunk.web.uri) {
-          sources.push({ title: chunk.web.title, uri: chunk.web.uri });
-        }
-      });
-    }
-
-    // Garantia de auditoria: sempre preservar exatamente o link original fornecido.
-    analysis.videoUrl = youtubeUrl;
-
-    // Incluir explicitamente o próprio vídeo como primeira fonte (sem depender do grounding).
-    const uniqueSources: GroundingSource[] = [
-      { title: 'YouTube (vídeo analisado)', uri: youtubeUrl },
-      ...sources,
-    ].filter((src, idx, arr) => {
-      const uri = (src.uri || '').trim();
-      if (!uri) return false;
-      return idx === arr.findIndex(s => (s.uri || '').trim() === uri);
-    });
-    analysis.sources = uniqueSources;
-
-    return analysis as Analysis;
+  return analysis as Analysis;
 };
 
 const extractFramesFromVideo = (file: File, maxFrames: number = 20): Promise<string[]> => {
-    return new Promise((resolve, reject) => {
-        const video = document.createElement('video');
-        const canvas = document.createElement('canvas');
-        const ctx = canvas.getContext('2d');
-        const frames: string[] = [];
-        video.src = URL.createObjectURL(file);
-        video.onloadedmetadata = () => {
-            canvas.width = video.videoWidth;
-            canvas.height = video.videoHeight;
-            let captured = 0;
-            const step = video.duration / maxFrames;
-            const capture = () => {
-                if (captured < maxFrames) {
-                    video.currentTime = captured * step;
-                    video.onseeked = () => {
-                        ctx?.drawImage(video, 0, 0);
-                        frames.push(canvas.toDataURL('image/jpeg', 0.5).split(',')[1]);
-                        captured++;
-                        capture();
-                    };
-                } else {
-                    URL.revokeObjectURL(video.src);
-                    resolve(frames);
-                }
-            };
+  return new Promise((resolve, reject) => {
+    const video = document.createElement("video");
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d");
+    const frames: string[] = [];
+
+    video.src = URL.createObjectURL(file);
+
+    video.onloadedmetadata = () => {
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+
+      let captured = 0;
+      const step = video.duration / maxFrames;
+
+      const capture = () => {
+        if (captured < maxFrames) {
+          video.currentTime = captured * step;
+          video.onseeked = () => {
+            ctx?.drawImage(video, 0, 0);
+            frames.push(canvas.toDataURL("image/jpeg", 0.5).split(",")[1]);
+            captured++;
             capture();
-        };
-        video.onerror = () => reject("Erro no processamento do vídeo.");
-    });
+          };
+        } else {
+          URL.revokeObjectURL(video.src);
+          resolve(frames);
+        }
+      };
+
+      capture();
+    };
+
+    video.onerror = () => reject("Erro no processamento do vídeo.");
+  });
 };
 
 const getAnalysisFromFile = async (file: File): Promise<Analysis> => {
-    const model = 'gemini-3-pro-preview';
-    const frames = await extractFramesFromVideo(file);
-    const imageParts = frames.map(data => ({ inlineData: { mimeType: 'image/jpeg', data } }));
-    
-    const response = await ai.models.generateContent({
-        model: model,
-        contents: {
-            parts: [
-                { text: `Você é um analista tático. A partir dos frames, identifique a partida e gere um JSON no mesmo formato do modo detalhado (V6).
+  const model = "gemini-3-pro-preview";
+  const frames = await extractFramesFromVideo(file);
+  const imageParts = frames.map((data) => ({ inlineData: { mimeType: "image/jpeg", data } }));
+
+  const response = await getClient().models.generateContent({
+    model,
+    contents: {
+      parts: [
+        {
+          text: `Você é um analista tático. A partir dos frames, identifique a partida e gere um JSON.
 
 Regras:
 - videoTitle deve ser o nome do arquivo.
 - videoUrl deve ser omitido ou null.
-- Se não for possível identificar os times/placar com confiança, retorne um JSON contendo a chave "error" com a mensagem: Incapaz de identificar a partida a partir do arquivo.
-
-Campos mínimos obrigatórios: videoTitle, timeA, timeB, placar, resumoPartida, momentosChave, faseDefensiva, faseOfensiva, estrategiaComportamento, estatisticas, pontosFortes, pontosFracos, analiseJogadores, conclusaoRecomendacoes.
-` },
-                ...imageParts
-            ]
+- Se não for possível identificar os times/placar com confiança, retorne um JSON com "error".
+`,
         },
-        config: {
-            thinkingConfig: { thinkingBudget: 2000 }
-        }
-    });
+        ...imageParts,
+      ],
+    },
+    config: { thinkingConfig: { thinkingBudget: 2000 } },
+  });
 
-    const analysis = parseJsonResponse<Analysis>(response.text);
-    if (!analysis) throw new Error("Falha na análise visual.");
-    analysis.videoTitle = file.name;
-    // Arquivo local não possui URL de origem.
-    analysis.videoUrl = undefined;
-    return analysis;
+  const analysis = parseJsonResponse<Analysis>(response.text);
+  if (!analysis) throw new Error("Falha na análise visual.");
+  (analysis as any).videoTitle = file.name;
+  (analysis as any).videoUrl = undefined;
+  return analysis;
 };
 
 export const analyzeFootballMatch = async (input: any): Promise<Analysis> => {
-    if (input.type === 'file') return await getAnalysisFromFile(input.file);
-    return await getAnalysisFromWeb(input.url, input.mode);
+  if (input.type === "file") return await getAnalysisFromFile(input.file);
+  return await getAnalysisFromWeb(input.url, input.mode);
 };
